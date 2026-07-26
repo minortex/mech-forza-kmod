@@ -4,7 +4,7 @@ _pkgbase=mech-forza-kmod
 _dkmsname=mechrevo-ec
 pkgname=mech-forza-kmod-dkms-git
 pkgver=r0.0000000
-pkgrel=1
+pkgrel=2
 pkgdesc="Lightweight GX4HRXL ACPI EC platform driver (DKMS)"
 arch=('x86_64')
 url="https://github.com/minortex/mech-forza-kmod"
@@ -29,6 +29,8 @@ package() {
   install -Dm644 Makefile "$dkms_src/Makefile"
   install -Dm644 mechrevo-ec.c "$dkms_src/mechrevo-ec.c"
   install -Dm644 mechrevo_ec_uapi.h "$dkms_src/mechrevo_ec_uapi.h"
+  install -Dm644 60-mechrevo-ec.rules \
+    "$pkgdir/usr/lib/udev/rules.d/60-mechrevo-ec.rules"
 
   cat >"$dkms_src/dkms.conf" <<EOF_DKMS
 PACKAGE_NAME="$_dkmsname"

@@ -231,7 +231,7 @@ static void mechrevo_clear_ap_exists(void *context)
 }
 
 /* -------------------------------------------------------------------------- */
-/* Root-only userspace EC bridge                                               */
+/* Userspace EC bridge; devtmpfs starts root-only, udev may delegate access     */
 
 static int mechrevo_misc_open(struct inode *inode, struct file *file)
 {

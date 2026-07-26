@@ -15,15 +15,16 @@
 
 - 只在 DMI 同时匹配 `MECHREVO` 和 `GX4HRXL` 时 probe。
 - 只绑定 ACPI ID `INOU0000`，并要求存在 `ECRR`、`ECRW`。
-- `/dev/mechrevo-ec` 权限为 `0600`，同一时间只允许一个用户进程打开。
+- 内核以 `0600 root:root` 创建设备；Arch DKMS 包通过 udev 调整为 `0660 root:wheel`。
+  只有 root 和 `wheel` 管理员组可以访问，同一时间仍只允许一个用户进程打开。
 - ioctl 数据固定为 4 字节，只接受地址 `0x0000..0x0FFF` 和单字节值。
 - 所有 EC 操作共用一个 mutex；`UPDATE_BITS` 在同一临界区内完成原子读改写。
 - 每次 ACPI EC 访问后等待 6 ms，与 OEM/参考驱动的时序一致。
 - 不在内核复制业务寄存器白名单。寄存器语义和值域仍由
   [`ec-register-map.md`](https://github.com/minortex/mech-forza-control/blob/master/docs/ec-register-map.md) 和 Python 控制层维护；EC 固件的 H2RAM ACL 是最终硬件边界。
 
-这比允许任意进程映射物理内存安全得多，但 **root 对 EC 的写操作仍可能造成异常风扇、功耗或
-充电行为**，不能把设备节点开放给不受信任用户。
+这比允许任意进程映射物理内存安全得多，但 **有设备写权限的进程仍可能造成异常风扇、功耗或
+充电行为**。因此软件包只开放给 `wheel`，不要把设备设置为 `0666`，也不要授权给不受信任用户。
 
 ## ApExistFlag 生命周期
 
@@ -87,6 +88,16 @@ headers 包）。
 DKMS 自动构建和安装模块，**不会自动加载模块或抢占 `INOU0000`**。首次加载以及与
 `uniwill_laptop` 的冲突处理仍应由用户手动完成。
 
+软件包同时安装 `60-mechrevo-ec.rules`。Arch 的 systemd/udev pacman hook 会重载规则并重新触发
+设备；规则将节点设置为：
+
+```text
+crw-rw---- root wheel /dev/mechrevo-ec
+```
+
+用户属于 `wheel` 时，默认内核后端不再需要 sudo。可以用 `id -nG` 检查组成员关系；组成员变更
+需要重新登录后生效。手工编译但未安装该 udev 规则时，设备仍保持内核的安全默认值 `0600`。
+
 ## 加载前的冲突检查
 
 `INOU0000` 同一时间只能由一个 platform driver 绑定。若 `uniwill_laptop` 已经绑定，新驱动不会
@@ -105,7 +116,7 @@ lsmod | grep -E 'uniwill|mechrevo'
 [mech-forza-control](https://github.com/minortex/mech-forza-control) 在 Linux 上默认只使用该内核桥接：
 
 ```bash
-sudo uv run mfc mode status
+uv run mfc mode status
 ```
 
 如果 `/dev/mechrevo-ec` 不存在或权限不足，程序会明确报错，**不会静默退回 `/dev/mem`**。
