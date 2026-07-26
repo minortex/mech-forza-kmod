@@ -64,7 +64,8 @@
 #define KBD_LEVEL_MASK			GENMASK(7, 5)
 #define KBD_APPLY			BIT(4)
 #define KBD_POWER_OFF			BIT(1)
-#define KBD_MAX_LEVEL			4
+/* Stable LED levels: 0=off (000), 1=dim (001), 2=bright (010). */
+#define KBD_MAX_BRIGHTNESS		2
 
 #define OSD_KB_LED_LEVEL0		0x3b
 #define OSD_KB_LED_LEVEL1		0x3c
@@ -579,7 +580,7 @@ static int mechrevo_kbd_set(struct led_classdev *led_cdev,
 	u8 value;
 	int ret;
 
-	if (brightness > KBD_MAX_LEVEL)
+	if (brightness > KBD_MAX_BRIGHTNESS)
 		return -EINVAL;
 
 	mutex_lock(&ec->io_lock);
@@ -607,7 +608,7 @@ static enum led_brightness mechrevo_kbd_get(struct led_classdev *led_cdev)
 		return LED_OFF;
 
 	value = FIELD_GET(KBD_LEVEL_MASK, value);
-	return value <= KBD_MAX_LEVEL ? value : LED_OFF;
+	return value <= KBD_MAX_BRIGHTNESS ? value : LED_OFF;
 }
 
 static int mechrevo_kbd_init(struct mechrevo_ec *ec)
@@ -617,7 +618,7 @@ static int mechrevo_kbd_init(struct mechrevo_ec *ec)
 		.default_label = ":kbd_backlight",
 	};
 
-	ec->kbd_backlight.max_brightness = KBD_MAX_LEVEL;
+	ec->kbd_backlight.max_brightness = KBD_MAX_BRIGHTNESS;
 	ec->kbd_backlight.flags = LED_REJECT_NAME_CONFLICT | LED_BRIGHT_HW_CHANGED;
 	ec->kbd_backlight.brightness_set_blocking = mechrevo_kbd_set;
 	ec->kbd_backlight.brightness_get = mechrevo_kbd_get;

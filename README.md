@@ -55,7 +55,8 @@ AML 方法。Python 继续负责风扇表、TCC、设置项等业务语义；内
 - `platform_profile`：`low-power` / `balanced` / `performance`，分别对应 Office (`0xA0`)、
   Gaming (`0x00`) 和 Turbo (`0x10`)；切换时保留 `0x0751.bit6` FanBoost，不改风扇表、TCC
   或其他设置。
-- LED class：`mechrevo::kbd_backlight`。
+- LED class：`mechrevo::kbd_backlight`，只暴露稳定的 `0=关闭`、`1=暗`、`2=亮`；
+  不暴露会扰乱 EC 快捷键状态的中间编码 `011`/`100`。
 - hwmon：CPU 温度、两个风扇 RPM、两个风扇只读 PWM。
 - WMI/input：性能档位按键、键盘背光按键和硬件亮度变化通知。
 
