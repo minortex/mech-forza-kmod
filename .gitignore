@@ -1,0 +1,13 @@
+.*.cmd
+*.ko
+*.mod
+*.mod.c
+*.o
+Module.symvers
+modules.order
+
+# makepkg work and package output
+/src/
+/pkg/
+*.pkg.tar.*
+/build
