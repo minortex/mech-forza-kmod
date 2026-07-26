@@ -7,21 +7,29 @@
 安装和维护。
 
 
-驱动通过固件设备 `INOU0000` 的 `ECRR`/`ECRW` 方法访问 12 位 EC XRAM，而不是映射
-`/dev/mem`。Python 继续负责风扇表、TCC、设置项等业务语义；内核负责 ACPI 调用、串行化、
-生命周期和最基本的输入检查。
+驱动从固件设备 `INOU0000._CRS` 取得并独占 `0xFED50000..0xFED50FFF` 的 4 KiB
+EC XRAM MMIO 资源，不向用户态暴露 `mmap`，也不再对每个字节反复执行 `ECRR`/`ECRW`
+AML 方法。Python 继续负责风扇表、TCC、设置项等业务语义；内核负责资源所有权、访问范围、
+串行化、生命周期和批量事务。
 
 ## 安全边界
 
 - 只在 DMI 同时匹配 `MECHREVO` 和 `GX4HRXL` 时 probe。
-- 只绑定 ACPI ID `INOU0000`，并要求存在 `ECRR`、`ECRW`。
+- 只绑定 ACPI ID `INOU0000`；必须从平台资源取得精确的 `0xFED50000`、长度 `0x1000`
+  MMIO 窗口，否则拒绝加载。驱动不使用无资源声明的硬编码 `ioremap` fallback。
 - 内核以 `0600 root:root` 创建设备；Arch DKMS 包通过 udev 调整为 `0660 root:wheel`。
-  只有 root 和 `wheel` 管理员组可以访问，同一时间仍只允许一个用户进程打开。
-- ioctl 数据固定为 4 字节，只接受地址 `0x0000..0x0FFF` 和单字节值。
-- 所有 EC 操作共用一个 mutex；`UPDATE_BITS` 在同一临界区内完成原子读改写。
-- 每次 ACPI EC 访问后等待 6 ms，与 OEM/参考驱动的时序一致。
+  只有 root 和 `wheel` 管理员组可以访问。允许多个客户端同时打开，便于一边 monitor 一边
+  切换模式；所有客户端及 hwmon/LED/platform_profile 访问仍共用设备级 mutex。
+- ioctl 只接受 `0x0000..0x0FFF`：单字节访问、最长 128 字节连续 block，以及最多 128 个
+  READ/WRITE/UPDATE_BITS 操作的 vector transaction。整组 transaction 在一个 mutex 临界区
+  内执行，其他客户端不能插入半组硬件操作。
+- MMIO 仅由内核 `readb()`/`writeb()` 访问；用户态不能获得物理地址映射。地址、长度、操作类型、
+  reserved 字段和写权限都会在持锁前验证。
+- 驱动解绑时先禁止新的 `open`/ioctl、注销 misc 设备并等待现有 fd 全部关闭，
+  然后才允许 devres 解除 MMIO 映射，避免仍存活的文件描述符访问已释放资源。
 - 不在内核复制业务寄存器白名单。寄存器语义和值域仍由
-  [`ec-register-map.md`](https://github.com/minortex/mech-forza-control/blob/master/docs/ec-register-map.md) 和 Python 控制层维护；EC 固件的 H2RAM ACL 是最终硬件边界。
+  [`ec-register-map.md`](https://github.com/minortex/mech-forza-control/blob/master/docs/ec-register-map.md) 和 Python 控制层维护。H2RAM ACL 可能让部分寄存器只读，但它不是唯一安全边界；
+  设备节点权限、严格资源范围和受控 ioctl 同样必要。
 
 这比允许任意进程映射物理内存安全得多，但 **有设备写权限的进程仍可能造成异常风扇、功耗或
 充电行为**。因此软件包只开放给 `wheel`，不要把设备设置为 `0666`，也不要授权给不受信任用户。
@@ -41,7 +49,9 @@
 
 加载成功后提供：
 
-- `/dev/mechrevo-ec`：Python 使用的 READ、WRITE、UPDATE_BITS ioctl。
+- `/dev/mechrevo-ec`：Python 使用的 READ、WRITE、UPDATE_BITS、READ_BLOCK、
+  WRITE_BLOCK 和 XFER ioctl。设备可被多个客户端同时打开；每个 ioctl/transaction 仍由同一
+  设备 mutex 串行执行。
 - `platform_profile`：`low-power` / `balanced` / `performance`，分别对应 Office (`0xA0`)、
   Gaming (`0x00`) 和 Turbo (`0x10`)；切换时保留 `0x0751.bit6` FanBoost，不改风扇表、TCC
   或其他设置。

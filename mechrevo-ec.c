@@ -2,25 +2,23 @@
 /*
  * Minimal ACPI EC driver for the MECHREVO WUJIE 14 GX4HRXL.
  *
- * The firmware exposes byte EC access through INOU0000.ECRR/ECRW. This
- * driver intentionally contains no dGPU, lightbar or multi-model code. It
- * owns the AP-exists lifecycle, exposes a narrow root-only EC device for the
- * userspace controller, and registers the small set of stable Linux-native
- * interfaces used by this machine.
+ * INOU0000 describes the EC XRAM window as a 4 KiB MMIO resource. This driver
+ * owns that resource and exposes checked byte/block access rather than
+ * repeatedly evaluating the firmware's ECRR/ECRW AML wrappers. It
+ * intentionally contains no dGPU, lightbar or multi-model code.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
-#include <linux/atomic.h>
 #include <linux/bitfield.h>
-#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dmi.h>
 #include <linux/fs.h>
 #include <linux/hwmon.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
+#include <linux/io.h>
 #include <linux/leds.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -28,7 +26,9 @@
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/pm.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 #include <linux/wmi.h>
 
 #include "mechrevo_ec_uapi.h"
@@ -38,7 +38,8 @@
 #define MECHREVO_EVENT_GUID		"ABBC0F72-8EA1-11D1-00A0-C90629100000"
 
 #define EC_MAX_ADDR			0x0fff
-#define EC_DELAY_US			6000
+#define EC_MMIO_BASE			0xfed50000
+#define EC_MMIO_SIZE			0x1000
 
 #define EC_ADDR_CPU_TEMP		0x043e
 #define EC_ADDR_MAIN_FAN_RPM_HI		0x0464
@@ -79,9 +80,12 @@
 
 struct mechrevo_ec {
 	struct device *dev;
-	acpi_handle handle;
+	u8 __iomem *mmio;
 	struct mutex io_lock;
-	atomic_t misc_open;
+	struct mutex users_lock;
+	wait_queue_head_t close_wait;
+	unsigned int open_count;
+	bool removing;
 	struct miscdevice miscdev;
 	struct led_classdev kbd_backlight;
 	struct input_dev *input;
@@ -97,63 +101,19 @@ static struct mechrevo_ec *global_data;
 
 static int mechrevo_ec_read_unlocked(struct mechrevo_ec *ec, u16 addr, u8 *value)
 {
-	union acpi_object param = {
-		.integer = {
-			.type = ACPI_TYPE_INTEGER,
-			.value = addr,
-		},
-	};
-	struct acpi_object_list input = {
-		.count = 1,
-		.pointer = &param,
-	};
-	unsigned long long output;
-	acpi_status status;
-
 	if (addr > EC_MAX_ADDR)
 		return -EINVAL;
 
-	status = acpi_evaluate_integer(ec->handle, "ECRR", &input, &output);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-	if (output > U8_MAX)
-		return -ERANGE;
-
-	usleep_range(EC_DELAY_US, EC_DELAY_US * 2);
-	*value = output;
+	*value = readb(ec->mmio + addr);
 	return 0;
 }
 
 static int mechrevo_ec_write_unlocked(struct mechrevo_ec *ec, u16 addr, u8 value)
 {
-	union acpi_object params[2] = {
-		{
-			.integer = {
-				.type = ACPI_TYPE_INTEGER,
-				.value = addr,
-			},
-		},
-		{
-			.integer = {
-				.type = ACPI_TYPE_INTEGER,
-				.value = value,
-			},
-		},
-	};
-	struct acpi_object_list input = {
-		.count = ARRAY_SIZE(params),
-		.pointer = params,
-	};
-	acpi_status status;
-
 	if (addr > EC_MAX_ADDR)
 		return -EINVAL;
 
-	status = acpi_evaluate_object(ec->handle, "ECRW", &input, NULL);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-
-	usleep_range(EC_DELAY_US, EC_DELAY_US * 2);
+	writeb(value, ec->mmio + addr);
 	return 0;
 }
 
@@ -237,36 +197,64 @@ static int mechrevo_misc_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice *misc = file->private_data;
 	struct mechrevo_ec *ec = container_of(misc, struct mechrevo_ec, miscdev);
+	int ret;
 
-	if (atomic_cmpxchg(&ec->misc_open, 0, 1))
-		return -EBUSY;
+	mutex_lock(&ec->users_lock);
+	if (ec->removing) {
+		ret = -ENODEV;
+	} else {
+		ec->open_count++;
+		ret = 0;
+	}
+	mutex_unlock(&ec->users_lock);
+	if (ret < 0)
+		return ret;
 
 	file->private_data = ec;
-	return nonseekable_open(inode, file);
+	ret = nonseekable_open(inode, file);
+	if (ret < 0) {
+		mutex_lock(&ec->users_lock);
+		ec->open_count--;
+		mutex_unlock(&ec->users_lock);
+		wake_up_all(&ec->close_wait);
+	}
+	return ret;
 }
 
 static int mechrevo_misc_release(struct inode *inode, struct file *file)
 {
 	struct mechrevo_ec *ec = file->private_data;
 
-	atomic_set(&ec->misc_open, 0);
+	mutex_lock(&ec->users_lock);
+	if (WARN_ON(!ec->open_count)) {
+		mutex_unlock(&ec->users_lock);
+		return 0;
+	}
+	ec->open_count--;
+	mutex_unlock(&ec->users_lock);
+	wake_up_all(&ec->close_wait);
 	return 0;
 }
 
-static long mechrevo_misc_ioctl(struct file *file, unsigned int cmd,
-				unsigned long arg)
+static bool mechrevo_ec_range_valid(u16 addr, u16 length)
 {
-	struct mechrevo_ec *ec = file->private_data;
+	return length && addr <= EC_MAX_ADDR && length <= EC_MMIO_SIZE - addr;
+}
+
+static long mechrevo_misc_ioctl_byte(struct mechrevo_ec *ec,
+				     struct file *file, unsigned int cmd,
+				     void __user *argp)
+{
 	struct mechrevo_ec_io io;
 	u8 value;
 	int ret;
 
-	if (_IOC_TYPE(cmd) != MECHREVO_EC_IOC_MAGIC)
-		return -ENOTTY;
-	if (copy_from_user(&io, (void __user *)arg, sizeof(io)))
+	if (copy_from_user(&io, argp, sizeof(io)))
 		return -EFAULT;
 	if (io.addr > EC_MAX_ADDR)
 		return -EINVAL;
+	if (cmd != MECHREVO_EC_IOC_READ && !(file->f_mode & FMODE_WRITE))
+		return -EBADF;
 
 	mutex_lock(&ec->io_lock);
 	switch (cmd) {
@@ -290,11 +278,160 @@ static long mechrevo_misc_ioctl(struct file *file, unsigned int cmd,
 	if (ret < 0)
 		return ret;
 
-	if ((_IOC_DIR(cmd) & _IOC_READ) &&
-	    copy_to_user((void __user *)arg, &io, sizeof(io)))
+	if ((_IOC_DIR(cmd) & _IOC_READ) && copy_to_user(argp, &io, sizeof(io)))
 		return -EFAULT;
 
 	return 0;
+}
+
+static long mechrevo_misc_ioctl_block(struct mechrevo_ec *ec,
+				      struct file *file, unsigned int cmd,
+				      void __user *argp)
+{
+	struct mechrevo_ec_block block;
+	u16 i;
+
+	if (copy_from_user(&block, argp, sizeof(block)))
+		return -EFAULT;
+	if (!mechrevo_ec_range_valid(block.addr, block.length) ||
+	    block.length > MECHREVO_EC_BLOCK_MAX)
+		return -EINVAL;
+	if (cmd == MECHREVO_EC_IOC_WRITE_BLOCK &&
+	    !(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+
+	mutex_lock(&ec->io_lock);
+	if (cmd == MECHREVO_EC_IOC_READ_BLOCK) {
+		for (i = 0; i < block.length; i++)
+			block.data[i] = readb(ec->mmio + block.addr + i);
+	} else {
+		for (i = 0; i < block.length; i++)
+			writeb(block.data[i], ec->mmio + block.addr + i);
+	}
+	mutex_unlock(&ec->io_lock);
+
+	if (cmd == MECHREVO_EC_IOC_READ_BLOCK &&
+	    copy_to_user(argp, &block, sizeof(block)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int mechrevo_ec_validate_xfer(const struct mechrevo_ec_xfer *xfer,
+				     bool *has_write)
+{
+	u16 i;
+
+	if (!xfer->count || xfer->count > MECHREVO_EC_XFER_MAX_OPS ||
+	    xfer->reserved)
+		return -EINVAL;
+
+	*has_write = false;
+	for (i = 0; i < xfer->count; i++) {
+		const struct mechrevo_ec_op *op = &xfer->ops[i];
+
+		if (op->addr > EC_MAX_ADDR || op->reserved)
+			return -EINVAL;
+		switch (op->type) {
+		case MECHREVO_EC_OP_READ:
+			if (op->value || op->mask)
+				return -EINVAL;
+			break;
+		case MECHREVO_EC_OP_WRITE:
+			if (op->mask)
+				return -EINVAL;
+			*has_write = true;
+			break;
+		case MECHREVO_EC_OP_UPDATE_BITS:
+			*has_write = true;
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static long mechrevo_misc_ioctl_xfer(struct mechrevo_ec *ec,
+				     struct file *file, void __user *argp)
+{
+	struct mechrevo_ec_xfer *xfer;
+	bool has_write;
+	u16 i;
+	int ret;
+
+	xfer = memdup_user(argp, sizeof(*xfer));
+	if (IS_ERR(xfer))
+		return PTR_ERR(xfer);
+
+	ret = mechrevo_ec_validate_xfer(xfer, &has_write);
+	if (ret < 0)
+		goto out_free;
+	if (has_write && !(file->f_mode & FMODE_WRITE)) {
+		ret = -EBADF;
+		goto out_free;
+	}
+
+	mutex_lock(&ec->io_lock);
+	for (i = 0; i < xfer->count; i++) {
+		struct mechrevo_ec_op *op = &xfer->ops[i];
+
+		switch (op->type) {
+		case MECHREVO_EC_OP_READ:
+			ret = mechrevo_ec_read_unlocked(ec, op->addr, &op->value);
+			break;
+		case MECHREVO_EC_OP_WRITE:
+			ret = mechrevo_ec_write_unlocked(ec, op->addr, op->value);
+			break;
+		case MECHREVO_EC_OP_UPDATE_BITS:
+			ret = mechrevo_ec_update_bits_unlocked(ec, op->addr,
+							       op->mask, op->value,
+							       &op->value);
+			break;
+		default:
+			ret = -EINVAL;
+			break;
+		}
+		if (ret < 0)
+			break;
+	}
+	mutex_unlock(&ec->io_lock);
+	if (ret < 0)
+		goto out_free;
+
+	if (copy_to_user(argp, xfer, sizeof(*xfer)))
+		ret = -EFAULT;
+
+out_free:
+	kfree(xfer);
+	return ret;
+}
+
+static long mechrevo_misc_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg)
+{
+	struct mechrevo_ec *ec = file->private_data;
+	void __user *argp = (void __user *)arg;
+
+	if (_IOC_TYPE(cmd) != MECHREVO_EC_IOC_MAGIC)
+		return -ENOTTY;
+	if (READ_ONCE(ec->removing))
+		return -ENODEV;
+
+	switch (cmd) {
+	case MECHREVO_EC_IOC_READ:
+	case MECHREVO_EC_IOC_WRITE:
+	case MECHREVO_EC_IOC_UPDATE_BITS:
+		return mechrevo_misc_ioctl_byte(ec, file, cmd, argp);
+	case MECHREVO_EC_IOC_READ_BLOCK:
+	case MECHREVO_EC_IOC_WRITE_BLOCK:
+		return mechrevo_misc_ioctl_block(ec, file, cmd, argp);
+	case MECHREVO_EC_IOC_XFER:
+		return mechrevo_misc_ioctl_xfer(ec, file, argp);
+	default:
+		return -ENOTTY;
+	}
 }
 
 static const struct file_operations mechrevo_misc_fops = {
@@ -312,7 +449,12 @@ static void mechrevo_misc_deregister(void *context)
 {
 	struct mechrevo_ec *ec = context;
 
+	/* Stop new opens/ioctls before devres unmaps the MMIO window. */
+	mutex_lock(&ec->users_lock);
+	ec->removing = true;
+	mutex_unlock(&ec->users_lock);
 	misc_deregister(&ec->miscdev);
+	wait_event(ec->close_wait, !READ_ONCE(ec->open_count));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -752,6 +894,7 @@ static int mechrevo_probe(struct platform_device *pdev)
 {
 	struct mechrevo_ec *ec;
 	struct device *hwmon;
+	struct resource *res;
 	u8 project_id;
 	int ret;
 
@@ -764,16 +907,22 @@ static int mechrevo_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ec->dev = &pdev->dev;
-	ec->handle = ACPI_HANDLE(&pdev->dev);
-	if (!ec->handle)
-		return -ENODEV;
-	if (!acpi_has_method(ec->handle, "ECRR") ||
-	    !acpi_has_method(ec->handle, "ECRW"))
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
 		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "INOU0000 lacks ECRR/ECRW\n");
+				     "INOU0000 lacks an MMIO resource\n");
+	if (res->start != EC_MMIO_BASE || resource_size(res) != EC_MMIO_SIZE)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "unexpected MMIO resource %pr\n", res);
+
+	ec->mmio = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(ec->mmio))
+		return dev_err_probe(&pdev->dev, PTR_ERR(ec->mmio),
+				     "failed to map EC MMIO resource\n");
 
 	mutex_init(&ec->io_lock);
-	atomic_set(&ec->misc_open, 0);
+	mutex_init(&ec->users_lock);
+	init_waitqueue_head(&ec->close_wait);
 	platform_set_drvdata(pdev, ec);
 
 	ret = mechrevo_ec_read(ec, EC_ADDR_PROJECT_ID, &project_id);
