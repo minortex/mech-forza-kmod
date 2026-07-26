@@ -10,6 +10,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <acpi/battery.h>
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
 #include <linux/device.h>
@@ -25,6 +26,7 @@
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
+#include <linux/power_supply.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -53,8 +55,11 @@
 #define EC_ADDR_MAIN_FAN_DUTY		0x075b
 #define EC_ADDR_SECOND_FAN_DUTY		0x075c
 #define EC_ADDR_KBD_BACKLIGHT		0x078c
+#define EC_ADDR_BATTERY_CHARGE_LIMIT	0x07b9
 
 #define AP_EXISTS			BIT(0)
+#define BATTERY_CHARGE_LIMIT_MASK	GENMASK(6, 0)
+#define BATTERY_CHARGE_LIMIT_DEFAULT	100
 #define MODE_MASK			0xb0
 #define FAN_BOOST			BIT(6)
 #define MODE_OFFICE			0xa0
@@ -92,6 +97,7 @@ struct mechrevo_ec {
 	struct led_classdev kbd_backlight;
 	struct input_dev *input;
 	struct device *profile_dev;
+	struct acpi_battery_hook battery_hook;
 	u8 suspend_mode;
 	u8 suspend_backlight;
 	bool suspend_mode_valid;
@@ -190,6 +196,135 @@ static void mechrevo_clear_ap_exists(void *context)
 	ret = mechrevo_set_ap_exists(ec, false);
 	if (ret < 0)
 		dev_warn(ec->dev, "failed to clear ApExistFlag: %d\n", ret);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Standard ACPI battery charge-control threshold                              */
+
+static int mechrevo_charge_limit_get(struct mechrevo_ec *ec, int *limit)
+{
+	u8 value;
+	u8 raw_limit;
+	int ret;
+
+	ret = mechrevo_ec_read(ec, EC_ADDR_BATTERY_CHARGE_LIMIT, &value);
+	if (ret < 0)
+		return ret;
+
+	raw_limit = value & BATTERY_CHARGE_LIMIT_MASK;
+	if (!raw_limit) {
+		*limit = BATTERY_CHARGE_LIMIT_DEFAULT;
+		return 0;
+	}
+	if (raw_limit > BATTERY_CHARGE_LIMIT_DEFAULT)
+		return -EIO;
+
+	*limit = raw_limit;
+	return 0;
+}
+
+static int mechrevo_charge_limit_set(struct mechrevo_ec *ec, int limit)
+{
+	u8 encoded_limit;
+	u8 value;
+	int ret;
+
+	if (limit < 1 || limit > BATTERY_CHARGE_LIMIT_DEFAULT)
+		return -EINVAL;
+
+	/* The firmware encodes its default 100% limit as zero. */
+	encoded_limit = limit == BATTERY_CHARGE_LIMIT_DEFAULT ? 0 : limit;
+
+	mutex_lock(&ec->io_lock);
+	ret = mechrevo_set_ap_exists_unlocked(ec, true);
+	if (!ret)
+		ret = mechrevo_ec_update_bits_unlocked(
+			ec, EC_ADDR_BATTERY_CHARGE_LIMIT,
+			BATTERY_CHARGE_LIMIT_MASK, encoded_limit, NULL);
+	if (!ret)
+		ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT,
+						&value);
+	if (!ret && (value & BATTERY_CHARGE_LIMIT_MASK) != encoded_limit)
+		ret = -EIO;
+	mutex_unlock(&ec->io_lock);
+
+	return ret;
+}
+
+static int mechrevo_battery_get_property(struct power_supply *battery,
+					 const struct power_supply_ext *ext,
+					 void *data,
+					 enum power_supply_property property,
+					 union power_supply_propval *value)
+{
+	struct mechrevo_ec *ec = data;
+
+	if (property != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+		return -EINVAL;
+
+	return mechrevo_charge_limit_get(ec, &value->intval);
+}
+
+static int mechrevo_battery_set_property(struct power_supply *battery,
+					 const struct power_supply_ext *ext,
+					 void *data,
+					 enum power_supply_property property,
+					 const union power_supply_propval *value)
+{
+	struct mechrevo_ec *ec = data;
+
+	if (property != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+		return -EINVAL;
+
+	return mechrevo_charge_limit_set(ec, value->intval);
+}
+
+static int mechrevo_battery_property_is_writeable(
+					 struct power_supply *battery,
+					 const struct power_supply_ext *ext,
+					 void *data,
+					 enum power_supply_property property)
+{
+	return property == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
+}
+
+static const enum power_supply_property mechrevo_battery_properties[] = {
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static const struct power_supply_ext mechrevo_battery_ext = {
+	.name = DRIVER_NAME,
+	.properties = mechrevo_battery_properties,
+	.num_properties = ARRAY_SIZE(mechrevo_battery_properties),
+	.get_property = mechrevo_battery_get_property,
+	.set_property = mechrevo_battery_set_property,
+	.property_is_writeable = mechrevo_battery_property_is_writeable,
+};
+
+static int mechrevo_battery_add(struct power_supply *battery,
+				struct acpi_battery_hook *hook)
+{
+	struct mechrevo_ec *ec = container_of(hook, struct mechrevo_ec,
+					       battery_hook);
+
+	return power_supply_register_extension(battery, &mechrevo_battery_ext,
+					       ec->dev, ec);
+}
+
+static int mechrevo_battery_remove(struct power_supply *battery,
+				   struct acpi_battery_hook *hook)
+{
+	power_supply_unregister_extension(battery, &mechrevo_battery_ext);
+	return 0;
+}
+
+static int mechrevo_battery_init(struct mechrevo_ec *ec)
+{
+	ec->battery_hook.name = "Mechrevo charge control";
+	ec->battery_hook.add_battery = mechrevo_battery_add;
+	ec->battery_hook.remove_battery = mechrevo_battery_remove;
+
+	return devm_battery_hook_register(ec->dev, &ec->battery_hook);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -978,6 +1113,11 @@ static int mechrevo_probe(struct platform_device *pdev)
 	ret = mechrevo_input_init(ec);
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret, "failed to register WMI input\n");
+
+	ret = mechrevo_battery_init(ec);
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to register battery charge limit\n");
 
 	mutex_lock(&global_data_lock);
 	if (global_data) {
