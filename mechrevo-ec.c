@@ -72,6 +72,7 @@
 #define OSD_KB_LED_LEVEL2		0x3d
 #define OSD_KB_LED_LEVEL3		0x3e
 #define OSD_KB_LED_LEVEL4		0x3f
+#define OSD_AIRPLANE_MODE		0xa4
 #define OSD_PERFORMANCE_MODE_TOGGLE	0xb0
 #define OSD_KBDILLUMDOWN		0xb1
 #define OSD_KBDILLUMUP			0xb2
@@ -739,6 +740,7 @@ static const struct hwmon_chip_info mechrevo_hwmon_chip_info = {
 /* Minimal WMI/input support for mode and keyboard-backlight OSD               */
 
 static const struct key_entry mechrevo_keymap[] = {
+	{ KE_KEY, OSD_AIRPLANE_MODE, { KEY_RFKILL } },
 	{ KE_KEY, OSD_KBDILLUMDOWN, { KEY_KBDILLUMDOWN } },
 	{ KE_KEY, OSD_KBDILLUMUP, { KEY_KBDILLUMUP } },
 	{ KE_KEY, OSD_KBDILLUMTOGGLE, { KEY_KBDILLUMTOGGLE } },
@@ -793,6 +795,9 @@ static void mechrevo_wmi_notify(struct wmi_device *wdev, union acpi_object *obj)
 	}
 
 	switch (event) {
+	case OSD_AIRPLANE_MODE:
+		sparse_keymap_report_event(ec->input, event, 1, true);
+		break;
 	case OSD_PERFORMANCE_MODE_TOGGLE:
 		mechrevo_cycle_mode(ec);
 		break;
