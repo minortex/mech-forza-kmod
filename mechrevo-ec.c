@@ -51,18 +51,23 @@
 #define EC_ADDR_SECOND_FAN_RPM_HI	0x046c
 #define EC_ADDR_BATTERY_TEMP_LO		0x04a2
 #define EC_ADDR_BATTERY_TEMP_HI		0x04a3
+#define EC_ADDR_BATTERY_RSOC			0x04ab
 #define EC_ADDR_PROJECT_ID		0x0740
 #define EC_ADDR_AP_OEM			0x0741
 #define EC_ADDR_MODE_CTL		0x0751
 #define EC_ADDR_MAIN_FAN_DUTY		0x075b
 #define EC_ADDR_SECOND_FAN_DUTY		0x075c
 #define EC_ADDR_KBD_BACKLIGHT		0x078c
-#define EC_ADDR_BATTERY_CHARGE_LIMIT	0x07b9
+#define EC_ADDR_BATTERY_CHARGE_LIMIT_UP	0x07b9
+#define EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN	0x07d0
 
 #define AP_EXISTS			BIT(0)
 #define BATTERY_TEMP_KELVIN_OFFSET	2732
 #define BATTERY_CHARGE_LIMIT_MASK	GENMASK(6, 0)
+#define BATTERY_CHARGE_LIMIT_PHASE	BIT(7)
 #define BATTERY_CHARGE_LIMIT_DEFAULT	100
+#define BATTERY_CHARGE_LIMIT_WINDOW_MIN_END	2
+#define BATTERY_CHARGE_LIMIT_WINDOW_MAX_START	95
 #define MODE_MASK			0xb0
 #define FAN_BOOST			BIT(6)
 #define MODE_OFFICE			0xa0
@@ -223,53 +228,167 @@ static int mechrevo_battery_temp_get(struct mechrevo_ec *ec, int *temperature)
 	return 0;
 }
 
-static int mechrevo_charge_limit_get(struct mechrevo_ec *ec, int *limit)
+struct mechrevo_charge_window_state {
+	u8 rsoc;
+	u8 low_raw;
+	u8 high_raw;
+	u8 low;
+	u8 high;
+	bool cycle_active;
+	bool stopped;
+};
+
+static int mechrevo_charge_limit_high_decode(u8 raw, int *limit)
 {
-	u8 value;
-	u8 raw_limit;
-	int ret;
+	u8 encoded = raw & BATTERY_CHARGE_LIMIT_MASK;
 
-	ret = mechrevo_ec_read(ec, EC_ADDR_BATTERY_CHARGE_LIMIT, &value);
-	if (ret < 0)
-		return ret;
-
-	raw_limit = value & BATTERY_CHARGE_LIMIT_MASK;
-	if (!raw_limit) {
+	if (!encoded) {
 		*limit = BATTERY_CHARGE_LIMIT_DEFAULT;
 		return 0;
 	}
-	if (raw_limit > BATTERY_CHARGE_LIMIT_DEFAULT)
+	if (encoded > BATTERY_CHARGE_LIMIT_DEFAULT)
 		return -EIO;
 
-	*limit = raw_limit;
+	*limit = encoded;
 	return 0;
 }
 
-static int mechrevo_charge_limit_set(struct mechrevo_ec *ec, int limit)
+static int mechrevo_charge_limit_low_decode(u8 raw, int *limit)
 {
-	u8 encoded_limit;
+	u8 encoded = raw & BATTERY_CHARGE_LIMIT_MASK;
+
+	if (!encoded) {
+		*limit = 0;
+		return 0;
+	}
+	if (encoded > BATTERY_CHARGE_LIMIT_WINDOW_MAX_START)
+		return -EIO;
+
+	*limit = encoded;
+	return 0;
+}
+
+static int mechrevo_charge_window_read_unlocked(struct mechrevo_ec *ec,
+					struct mechrevo_charge_window_state *state)
+{
+	int ret;
+
+	ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_RSOC, &state->rsoc);
+	if (ret < 0)
+		return ret;
+
+	ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN,
+					&state->low_raw);
+	if (ret < 0)
+		return ret;
+
+	ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_UP,
+					&state->high_raw);
+	if (ret < 0)
+		return ret;
+
+	state->low = state->low_raw & BATTERY_CHARGE_LIMIT_MASK;
+	state->high = state->high_raw & BATTERY_CHARGE_LIMIT_MASK;
+	state->cycle_active = !!(state->low_raw & BATTERY_CHARGE_LIMIT_PHASE);
+	state->stopped = !!(state->high_raw & BATTERY_CHARGE_LIMIT_PHASE);
+	return 0;
+}
+
+static bool mechrevo_charge_window_choose_active(
+		const struct mechrevo_charge_window_state *old,
+		u8 low, u8 high)
+{
+	bool same_window;
+
+	if (old->rsoc <= low)
+		return true;
+	if (old->rsoc >= high)
+		return false;
+
+	same_window = old->low == low && old->high == high;
+	return same_window && old->cycle_active;
+}
+
+static int mechrevo_charge_window_get_end(struct mechrevo_ec *ec, int *limit)
+{
 	u8 value;
 	int ret;
 
-	if (limit < 1 || limit > BATTERY_CHARGE_LIMIT_DEFAULT)
+	ret = mechrevo_ec_read(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_UP, &value);
+	if (ret < 0)
+		return ret;
+
+	return mechrevo_charge_limit_high_decode(value, limit);
+}
+
+static int mechrevo_charge_window_get_start(struct mechrevo_ec *ec, int *limit)
+{
+	u8 value;
+	int ret;
+
+	ret = mechrevo_ec_read(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN, &value);
+	if (ret < 0)
+		return ret;
+
+	return mechrevo_charge_limit_low_decode(value, limit);
+}
+
+static int mechrevo_charge_window_set(struct mechrevo_ec *ec, int start,
+				      int end)
+{
+	struct mechrevo_charge_window_state old;
+	u8 new_low_raw;
+	u8 new_high_raw;
+	bool active;
+	int ret;
+
+	if (start < 0 || start > BATTERY_CHARGE_LIMIT_WINDOW_MAX_START)
+		return -EINVAL;
+	if (end < 1 || end > BATTERY_CHARGE_LIMIT_DEFAULT)
 		return -EINVAL;
 
-	/* The firmware encodes its default 100% limit as zero. */
-	encoded_limit = limit == BATTERY_CHARGE_LIMIT_DEFAULT ? 0 : limit;
+	if (!start) {
+		new_low_raw = 0;
+	} else {
+		if (end < BATTERY_CHARGE_LIMIT_WINDOW_MIN_END ||
+		    end >= BATTERY_CHARGE_LIMIT_DEFAULT || start >= end)
+			return -EINVAL;
+	}
 
 	mutex_lock(&ec->io_lock);
 	ret = mechrevo_set_ap_exists_unlocked(ec, true);
 	if (!ret)
-		ret = mechrevo_ec_update_bits_unlocked(
-			ec, EC_ADDR_BATTERY_CHARGE_LIMIT,
-			BATTERY_CHARGE_LIMIT_MASK, encoded_limit, NULL);
-	if (!ret)
-		ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT,
-						&value);
-	if (!ret && (value & BATTERY_CHARGE_LIMIT_MASK) != encoded_limit)
-		ret = -EIO;
-	mutex_unlock(&ec->io_lock);
+		ret = mechrevo_charge_window_read_unlocked(ec, &old);
+	if (ret < 0)
+		goto out_unlock;
 
+	if (!start) {
+		new_high_raw = end == BATTERY_CHARGE_LIMIT_DEFAULT ? 0 : end;
+		if (end != BATTERY_CHARGE_LIMIT_DEFAULT && old.rsoc >= end)
+			new_high_raw |= BATTERY_CHARGE_LIMIT_PHASE;
+	} else {
+		active = mechrevo_charge_window_choose_active(&old, start, end);
+		if (active) {
+			new_low_raw = start | BATTERY_CHARGE_LIMIT_PHASE;
+			new_high_raw = end;
+		} else {
+			new_low_raw = start;
+			new_high_raw = end | BATTERY_CHARGE_LIMIT_PHASE;
+		}
+	}
+
+	ret = mechrevo_ec_write_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN,
+					 new_low_raw);
+	if (!ret)
+		ret = mechrevo_ec_write_unlocked(ec, EC_ADDR_BATTERY_CHARGE_LIMIT_UP,
+					 new_high_raw);
+	if (!ret)
+		ret = mechrevo_charge_window_read_unlocked(ec, &old);
+	if (!ret && (old.low_raw != new_low_raw || old.high_raw != new_high_raw))
+		ret = -EIO;
+
+out_unlock:
+	mutex_unlock(&ec->io_lock);
 	return ret;
 }
 
@@ -284,8 +403,10 @@ static int mechrevo_battery_get_property(struct power_supply *battery,
 	switch (property) {
 	case POWER_SUPPLY_PROP_TEMP:
 		return mechrevo_battery_temp_get(ec, &value->intval);
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		return mechrevo_charge_window_get_start(ec, &value->intval);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
-		return mechrevo_charge_limit_get(ec, &value->intval);
+		return mechrevo_charge_window_get_end(ec, &value->intval);
 	default:
 		return -EINVAL;
 	}
@@ -299,10 +420,28 @@ static int mechrevo_battery_set_property(struct power_supply *battery,
 {
 	struct mechrevo_ec *ec = data;
 
-	if (property != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
-		return -EINVAL;
+	int start;
+	int end;
+	int ret;
 
-	return mechrevo_charge_limit_set(ec, value->intval);
+	switch (property) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		ret = mechrevo_charge_window_get_end(ec, &end);
+		if (ret < 0)
+			return ret;
+		start = value->intval;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		ret = mechrevo_charge_window_get_start(ec, &start);
+		if (ret < 0)
+			return ret;
+		end = value->intval;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return mechrevo_charge_window_set(ec, start, end);
 }
 
 static int mechrevo_battery_property_is_writeable(
@@ -311,11 +450,13 @@ static int mechrevo_battery_property_is_writeable(
 					 void *data,
 					 enum power_supply_property property)
 {
-	return property == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
+	return property == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	       property == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
 }
 
 static const enum power_supply_property mechrevo_battery_properties[] = {
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };
 
