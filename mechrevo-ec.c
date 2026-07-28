@@ -49,6 +49,8 @@
 /* GX4HRXL stores the secondary fan as low byte first, then high byte. */
 #define EC_ADDR_SECOND_FAN_RPM_LO	0x046b
 #define EC_ADDR_SECOND_FAN_RPM_HI	0x046c
+#define EC_ADDR_BATTERY_TEMP_LO		0x04a2
+#define EC_ADDR_BATTERY_TEMP_HI		0x04a3
 #define EC_ADDR_PROJECT_ID		0x0740
 #define EC_ADDR_AP_OEM			0x0741
 #define EC_ADDR_MODE_CTL		0x0751
@@ -58,6 +60,7 @@
 #define EC_ADDR_BATTERY_CHARGE_LIMIT	0x07b9
 
 #define AP_EXISTS			BIT(0)
+#define BATTERY_TEMP_KELVIN_OFFSET	2732
 #define BATTERY_CHARGE_LIMIT_MASK	GENMASK(6, 0)
 #define BATTERY_CHARGE_LIMIT_DEFAULT	100
 #define MODE_MASK			0xb0
@@ -199,7 +202,26 @@ static void mechrevo_clear_ap_exists(void *context)
 }
 
 /* -------------------------------------------------------------------------- */
-/* Standard ACPI battery charge-control threshold                              */
+/* Standard ACPI battery properties                                            */
+
+static int mechrevo_battery_temp_get(struct mechrevo_ec *ec, int *temperature)
+{
+	u8 low;
+	u8 high;
+	int ret;
+
+	mutex_lock(&ec->io_lock);
+	ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_TEMP_LO, &low);
+	if (!ret)
+		ret = mechrevo_ec_read_unlocked(ec, EC_ADDR_BATTERY_TEMP_HI, &high);
+	mutex_unlock(&ec->io_lock);
+	if (ret < 0)
+		return ret;
+
+	/* The EC reports battery temperature in tenths of a Kelvin. */
+	*temperature = ((u16)high << 8 | low) - BATTERY_TEMP_KELVIN_OFFSET;
+	return 0;
+}
 
 static int mechrevo_charge_limit_get(struct mechrevo_ec *ec, int *limit)
 {
@@ -259,10 +281,14 @@ static int mechrevo_battery_get_property(struct power_supply *battery,
 {
 	struct mechrevo_ec *ec = data;
 
-	if (property != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+	switch (property) {
+	case POWER_SUPPLY_PROP_TEMP:
+		return mechrevo_battery_temp_get(ec, &value->intval);
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		return mechrevo_charge_limit_get(ec, &value->intval);
+	default:
 		return -EINVAL;
-
-	return mechrevo_charge_limit_get(ec, &value->intval);
+	}
 }
 
 static int mechrevo_battery_set_property(struct power_supply *battery,
@@ -289,6 +315,7 @@ static int mechrevo_battery_property_is_writeable(
 }
 
 static const enum power_supply_property mechrevo_battery_properties[] = {
+	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };
 
