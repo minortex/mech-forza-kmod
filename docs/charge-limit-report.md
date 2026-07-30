@@ -1,5 +1,12 @@
 # 充电限制内核模块完善调研报告
 
+> 当前实现状态（2026-07-30）：本报告最初用于规划从 upper-only 到 charge-window 的升级。
+> 代码现已在 BAT0 暴露 `charge_control_start_threshold` 和
+> `charge_control_end_threshold`，写入时按 `0x07D0` 后 `0x07B9` 的顺序初始化 phase，
+> 并在 `/dev/mechrevo-ec` raw ioctl 触及 `0x07D0`/`0x07B9` 后发送 BAT0 变更通知。
+> v2.2 固件中的 lower 持久化由 EC 自己通过 `0x0773` 与 `0x077E/0x077F` 维护；内核只提供
+> 标准 start/end 阈值接口，不直接写 shadow 或提交握手。
+
 ## 1. 调研范围
 
 本报告基于以下两处控制层实现做对照分析：
@@ -533,15 +540,15 @@ README 至少补一句：
 
 ### 第一阶段（建议优先）
 
-- [ ] 重构 upper-only helper 为 window helper
-- [ ] 增加 `CHARGE_CONTROL_START_THRESHOLD`
-- [ ] 按 `battery.py` 实现 phase 初始化和 low->high 写序
-- [ ] set 后补 `power_supply_changed()`
-- [ ] README 补 lower-threshold firmware caveat
+- [x] 重构 upper-only helper 为 window helper
+- [x] 增加 `CHARGE_CONTROL_START_THRESHOLD`
+- [x] 按控制层实现 phase 初始化和 low->high 写序
+- [x] set 后补 `power_supply_changed()`
+- [x] README 补 lower-threshold firmware caveat
 
 ### 第二阶段
 
-- [ ] 为 misc ioctl 触及电池寄存器时补 BAT0 notify
+- [x] 为 misc ioctl 触及电池寄存器时补 BAT0 notify
 - [ ] 评估是否增加 `charge_limit_profile` 自定义属性映射 `0x07A6`
 
 ### 第三阶段（视实测）

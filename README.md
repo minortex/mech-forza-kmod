@@ -58,7 +58,10 @@ AML 方法。Python 继续负责风扇表、TCC、设置项等业务语义；内
 - LED class：`mechrevo::kbd_backlight`，只暴露稳定的 `0=关闭`、`1=暗`、`2=亮`；
   不暴露会扰乱 EC 快捷键状态的中间编码 `011`/`100`。
 - hwmon：CPU 温度、两个风扇 RPM、两个风扇只读 PWM。
-- power_supply：在 ACPI `BAT0` 上扩展电池温度和充电结束阈值。
+- power_supply：在 ACPI `BAT0` 上扩展电池温度，以及标准
+  `charge_control_start_threshold` / `charge_control_end_threshold` 充电窗口。
+  start/end 分别映射 EC `0x07D0` / `0x07B9`；lower-threshold hysteresis 需要兼容的
+  FlexiCharge EC 固件才会真正改变充电行为。
 - WMI/input：性能档位按键、键盘背光按键和硬件亮度变化通知。
 
 副风扇 RPM 使用 GX4HRXL 的 `high=0x046C`、`low=0x046B`。

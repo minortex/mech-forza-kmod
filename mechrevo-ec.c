@@ -106,6 +106,8 @@ struct mechrevo_ec {
 	struct input_dev *input;
 	struct device *profile_dev;
 	struct acpi_battery_hook battery_hook;
+	struct mutex battery_lock;
+	struct power_supply *battery;
 	u8 suspend_mode;
 	u8 suspend_backlight;
 	bool suspend_mode_valid;
@@ -384,7 +386,10 @@ static int mechrevo_charge_window_set(struct mechrevo_ec *ec, int start,
 					 new_high_raw);
 	if (!ret)
 		ret = mechrevo_charge_window_read_unlocked(ec, &old);
-	if (!ret && (old.low_raw != new_low_raw || old.high_raw != new_high_raw))
+	if (!ret && ((old.low_raw & BATTERY_CHARGE_LIMIT_MASK) !=
+		     (new_low_raw & BATTERY_CHARGE_LIMIT_MASK) ||
+		     (old.high_raw & BATTERY_CHARGE_LIMIT_MASK) !=
+		     (new_high_raw & BATTERY_CHARGE_LIMIT_MASK)))
 		ret = -EIO;
 
 out_unlock:
@@ -474,16 +479,52 @@ static int mechrevo_battery_add(struct power_supply *battery,
 {
 	struct mechrevo_ec *ec = container_of(hook, struct mechrevo_ec,
 					       battery_hook);
+	int ret;
 
-	return power_supply_register_extension(battery, &mechrevo_battery_ext,
-					       ec->dev, ec);
+	ret = power_supply_register_extension(battery, &mechrevo_battery_ext,
+					      ec->dev, ec);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&ec->battery_lock);
+	ec->battery = battery;
+	mutex_unlock(&ec->battery_lock);
+	return 0;
 }
 
 static int mechrevo_battery_remove(struct power_supply *battery,
 				   struct acpi_battery_hook *hook)
 {
+	struct mechrevo_ec *ec = container_of(hook, struct mechrevo_ec,
+					       battery_hook);
+
+	mutex_lock(&ec->battery_lock);
+	ec->battery = NULL;
+	mutex_unlock(&ec->battery_lock);
 	power_supply_unregister_extension(battery, &mechrevo_battery_ext);
 	return 0;
+}
+
+static void mechrevo_battery_changed(struct mechrevo_ec *ec)
+{
+	mutex_lock(&ec->battery_lock);
+	if (ec->battery)
+		power_supply_changed(ec->battery);
+	mutex_unlock(&ec->battery_lock);
+}
+
+static bool mechrevo_charge_limit_addr(u16 addr)
+{
+	return addr == EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN ||
+	       addr == EC_ADDR_BATTERY_CHARGE_LIMIT_UP;
+}
+
+static bool mechrevo_charge_limit_range(u16 addr, u16 length)
+{
+	return (addr <= EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN &&
+		EC_ADDR_BATTERY_CHARGE_LIMIT_DOWN < addr + length) ||
+	       (addr <= EC_ADDR_BATTERY_CHARGE_LIMIT_UP &&
+		EC_ADDR_BATTERY_CHARGE_LIMIT_UP < addr + length);
 }
 
 static int mechrevo_battery_init(struct mechrevo_ec *ec)
@@ -582,6 +623,8 @@ static long mechrevo_misc_ioctl_byte(struct mechrevo_ec *ec,
 	mutex_unlock(&ec->io_lock);
 	if (ret < 0)
 		return ret;
+	if (cmd != MECHREVO_EC_IOC_READ && mechrevo_charge_limit_addr(io.addr))
+		mechrevo_battery_changed(ec);
 
 	if ((_IOC_DIR(cmd) & _IOC_READ) && copy_to_user(argp, &io, sizeof(io)))
 		return -EFAULT;
@@ -614,6 +657,9 @@ static long mechrevo_misc_ioctl_block(struct mechrevo_ec *ec,
 			writeb(block.data[i], ec->mmio + block.addr + i);
 	}
 	mutex_unlock(&ec->io_lock);
+	if (cmd == MECHREVO_EC_IOC_WRITE_BLOCK &&
+	    mechrevo_charge_limit_range(block.addr, block.length))
+		mechrevo_battery_changed(ec);
 
 	if (cmd == MECHREVO_EC_IOC_READ_BLOCK &&
 	    copy_to_user(argp, &block, sizeof(block)))
@@ -663,6 +709,7 @@ static long mechrevo_misc_ioctl_xfer(struct mechrevo_ec *ec,
 {
 	struct mechrevo_ec_xfer *xfer;
 	bool has_write;
+	bool charge_limit_written = false;
 	u16 i;
 	int ret;
 
@@ -688,11 +735,15 @@ static long mechrevo_misc_ioctl_xfer(struct mechrevo_ec *ec,
 			break;
 		case MECHREVO_EC_OP_WRITE:
 			ret = mechrevo_ec_write_unlocked(ec, op->addr, op->value);
+			if (!ret && mechrevo_charge_limit_addr(op->addr))
+				charge_limit_written = true;
 			break;
 		case MECHREVO_EC_OP_UPDATE_BITS:
 			ret = mechrevo_ec_update_bits_unlocked(ec, op->addr,
 							       op->mask, op->value,
 							       &op->value);
+			if (!ret && mechrevo_charge_limit_addr(op->addr))
+				charge_limit_written = true;
 			break;
 		default:
 			ret = -EINVAL;
@@ -702,6 +753,8 @@ static long mechrevo_misc_ioctl_xfer(struct mechrevo_ec *ec,
 			break;
 	}
 	mutex_unlock(&ec->io_lock);
+	if (charge_limit_written)
+		mechrevo_battery_changed(ec);
 	if (ret < 0)
 		goto out_free;
 
@@ -1231,6 +1284,7 @@ static int mechrevo_probe(struct platform_device *pdev)
 
 	mutex_init(&ec->io_lock);
 	mutex_init(&ec->users_lock);
+	mutex_init(&ec->battery_lock);
 	init_waitqueue_head(&ec->close_wait);
 	platform_set_drvdata(pdev, ec);
 
